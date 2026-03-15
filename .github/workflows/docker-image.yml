@@ -3,27 +3,49 @@ name: Docker Image CI
 on:
   push:
     branches: [ "master" ]
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
 
 jobs:
-  build:
+  check-and-build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check for n8n Updates
+        id: check
+        run: |
+          OFFICIAL_DIGEST=$(curl -s "https://hub.docker.com/v2/repositories/n8nio/n8n/tags/latest" | jq -r '.digest')
+          SOLODOLOBOLO_DIGEST=$(curl -s "https://hub.docker.com/v2/repositories/solodolobolo/n8n/tags/latest" | jq -r '.images[] | select(.architecture=="amd64") | .digest' | head -n 1)
+
+          echo "Official: $OFFICIAL_DIGEST"
+          echo "Mine:     $SOLODOLOBOLO_DIGEST"
+
+          if [ "$OFFICIAL_DIGEST" != "$SOLODOLOBOLO_DIGEST" ] || [ "${{ github.event_name }}" == "push" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+          else
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Set up QEMU
+        if: steps.check.outputs.needs_update == 'true'
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
+        if: steps.check.outputs.needs_update == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
+        if: steps.check.outputs.needs_update == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push AMD64
+        if: steps.check.outputs.needs_update == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -32,6 +54,7 @@ jobs:
           tags: solodolobolo/n8n:amd64
 
       - name: Build and push ARM64
+        if: steps.check.outputs.needs_update == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -40,6 +63,7 @@ jobs:
           tags: solodolobolo/n8n:arm64
 
       - name: Create and push manifest
+        if: steps.check.outputs.needs_update == 'true'
         run: |
           docker buildx imagetools create -t solodolobolo/n8n:latest \
             solodolobolo/n8n:amd64 \
