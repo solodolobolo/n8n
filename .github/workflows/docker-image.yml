@@ -2,51 +2,162 @@ name: Build and Push n8n
 
 on:
   schedule:
-    - cron: '0 */6 * * *' # Check every 6 hours
+    - cron: '0 */6 * * *'
   push:
-    branches: [ "master" ]
+    branches: ["master"]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: n8n-build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   check-upstream:
     runs-on: ubuntu-latest
+
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
-      upstream_digest: ${{ steps.check.outputs.upstream_digest }}
-    steps:
-      - name: Check for updates
-        id: check
-        run: |
-          # Use skopeo to query the remote registry metadata for n8n instantly
-          UPSTREAM_DIGEST=$(skopeo inspect docker://n8nio/n8n:latest | jq -r '.Digest')
-          
-          # Query our own image to see what base digest it was last built with.
-          CURRENT_BASE_DIGEST=$(skopeo inspect docker://solodolobolo/n8n:latest 2>/dev/null | jq -r '.Labels["org.opencontainers.image.base.digest"]' || echo "none")
-          
-          echo "Upstream Digest: $UPSTREAM_DIGEST"
-          echo "Current Base Digest: $CURRENT_BASE_DIGEST"
-          
-          echo "upstream_digest=$UPSTREAM_DIGEST" >> $GITHUB_OUTPUT
-          
-          # Force a build if it's a manual trigger, a push to master, OR if the digests don't match
-          if [ "$UPSTREAM_DIGEST" != "$CURRENT_BASE_DIGEST" ] || [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "should_build=true" >> $GITHUB_OUTPUT
-            echo "Update found or manual/push trigger detected. Building."
-          else
-            echo "should_build=false" >> $GITHUB_OUTPUT
-            echo "No updates to base image. Skipping build."
-          fi
+      n8n_version: ${{ steps.check.outputs.n8n_version }}
 
-  build:
-    needs: check-upstream
-    if: needs.check-upstream.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check versions
+        id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 -u - <<'PY'
+          import os
+          import re
+          import subprocess
+          import time
+          from pathlib import Path
+
+          dockerfile = Path("Dockerfile").read_text()
+
+          def version_key(value):
+              return tuple(map(int, value.split(".")))
+
+          def current_version():
+              pattern = (
+                  r"^[ \t]*ARG[ \t]+N8N_VERSION[ \t]*=[ \t]*"
+                  r"[\"']?(\d+\.\d+\.\d+)[\"']?[ \t]*(?:#.*)?$"
+              )
+
+              matches = re.findall(
+                  pattern, dockerfile, re.MULTILINE
+              )
+
+              if len(matches) != 1:
+                  raise RuntimeError(
+                      "Expected exactly one ARG N8N_VERSION=x.y.z"
+                  )
+
+              return matches[0]
+
+          def stable_version():
+              for attempt in range(3):
+                  try:
+                      subprocess.run(
+                          ["docker", "pull", "n8nio/n8n:stable"],
+                          check=True,
+                          timeout=300,
+                      )
+
+                      result = subprocess.run(
+                          [
+                              "docker", "run", "--rm",
+                              "--entrypoint", "n8n",
+                              "n8nio/n8n:stable", "--version",
+                          ],
+                          check=True,
+                          capture_output=True,
+                          text=True,
+                          timeout=120,
+                      )
+
+                      version = result.stdout.strip()
+
+                      if not re.fullmatch(
+                          r"\d+\.\d+\.\d+", version
+                      ):
+                          raise RuntimeError(
+                              f"Unexpected stable version: {version!r}"
+                          )
+
+                      return version
+
+                  except Exception as error:
+                      print(
+                          f"Version check attempt {attempt + 1} failed: "
+                          f"{error}",
+                          flush=True,
+                      )
+
+                      if attempt == 2:
+                          raise
+
+                      time.sleep(3)
+
+          current = current_version()
+          upstream = stable_version()
+
+          newer = version_key(upstream) > version_key(current)
+          selected = upstream if newer else current
+
+          should_build = (
+              newer
+              or os.environ["EVENT_NAME"] in (
+                  "push",
+                  "workflow_dispatch",
+              )
+          )
+
+          print(
+              f"N8N_VERSION: current={current}, upstream={upstream}, "
+              f"selected={selected}",
+              flush=True,
+          )
+          print(f"Build required: {should_build}", flush=True)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(
+                  f"should_build={str(should_build).lower()}\n"
+              )
+              output.write(f"n8n_version={selected}\n")
+          PY
+
+  build-and-test:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+
+    env:
+      TEST_IMAGE: n8n-ci:${{ matrix.arch }}
+      TEST_PLATFORM: linux/${{ matrix.arch }}
+      N8N_VERSION: ${{ needs.check-upstream.outputs.n8n_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -57,16 +168,685 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build image
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: solodolobolo/n8n:latest
+          platforms: ${{ env.TEST_PLATFORM }}
+          load: true
+          push: false
           pull: true
-          labels: |
-            org.opencontainers.image.base.name=n8nio/n8n:latest
-            org.opencontainers.image.base.digest=${{ needs.check-upstream.outputs.upstream_digest }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          provenance: false
+          tags: ${{ env.TEST_IMAGE }}
+          build-args: |
+            N8N_VERSION=${{ env.N8N_VERSION }}
+          cache-from: type=gha,scope=n8n-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=n8n-${{ matrix.arch }}
+
+      - name: Check architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          actual="$(docker image inspect \
+            --format '{{.Architecture}}' "$TEST_IMAGE")"
+
+          echo "Expected: $EXPECTED_ARCH; actual: $actual"
+          test "$actual" = "$EXPECTED_ARCH"
+
+          echo "PASS: image architecture is $actual"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test executables
+        run: |
+          set -euo pipefail
+
+          docker run --rm \
+            --platform "$TEST_PLATFORM" \
+            --entrypoint /bin/sh \
+            "$TEST_IMAGE" -ec '
+              for executable in \
+                /usr/sbin/groupmod \
+                /usr/sbin/usermod \
+                /usr/sbin/groupadd \
+                /usr/sbin/useradd \
+                /usr/bin/getent \
+                /sbin/su-exec \
+                /entrypoint.sh
+              do
+                echo "Checking $executable"
+                test -x "$executable"
+              done
+
+              echo "Checking node"
+              command -v node
+              node --version
+
+              echo "Checking n8n"
+              command -v n8n
+
+              echo "Checking su-exec"
+              test "$(su-exec 12345:23456 id -u)" = 12345
+              test "$(su-exec 12345:23456 id -g)" = 23456
+
+              echo "PASS: required executables and su-exec"
+            '
+
+      - name: Check n8n version
+        run: |
+          set -euo pipefail
+
+          actual="$(docker run --rm \
+            --platform "$TEST_PLATFORM" \
+            --entrypoint n8n \
+            "$TEST_IMAGE" --version)"
+
+          actual="$(printf '%s' "$actual" | tr -d '\r')"
+
+          echo "Expected: $N8N_VERSION; actual: $actual"
+          test "$actual" = "$N8N_VERSION"
+
+          echo "PASS: n8n version is $actual"
+
+      - name: Test random UID/GID, storage, and restart
+        timeout-minutes: 20
+        run: |
+          python -u - <<'PY'
+          import os
+          import random
+          import subprocess
+          import time
+
+          image = os.environ["TEST_IMAGE"]
+          platform = os.environ["TEST_PLATFORM"]
+          container = "test_n8n"
+
+          uid = random.randint(10000, 19999)
+          gid = random.randint(20000, 29999)
+
+          def docker(
+              *args,
+              capture=False,
+              check=True,
+              timeout=120,
+          ):
+              return subprocess.run(
+                  ["docker", *args],
+                  check=check,
+                  capture_output=capture,
+                  text=True,
+                  timeout=timeout,
+              )
+
+          def check_running():
+              result = docker(
+                  "inspect",
+                  "--format", "{{.State.Running}}",
+                  container,
+                  capture=True,
+              )
+
+              if result.stdout.strip() != "true":
+                  raise RuntimeError(
+                      "n8n exited; see cleanup logs"
+                  )
+
+          def wait_ready(label):
+              timeout_seconds = 480
+              deadline = time.monotonic() + timeout_seconds
+              last_log = 0
+              last_error = "No readiness probe completed"
+
+              script = r"""
+              fetch(
+                "http://127.0.0.1:5678/healthz/readiness",
+                { signal: AbortSignal.timeout(5000) }
+              )
+                .then(response => {
+                  if (!response.ok) {
+                    console.error("HTTP " + response.status);
+                  }
+
+                  process.exit(response.ok ? 0 : 1);
+                })
+                .catch(error => {
+                  console.error(error.message);
+                  process.exit(1);
+                });
+              """
+
+              while time.monotonic() < deadline:
+                  check_running()
+
+                  remaining = deadline - time.monotonic()
+
+                  if remaining <= 0:
+                      break
+
+                  try:
+                      result = docker(
+                          "exec", container,
+                          "node", "-e", script,
+                          capture=True,
+                          check=False,
+                          timeout=min(30, remaining),
+                      )
+
+                      if result.returncode == 0:
+                          print(f"READY: {label}", flush=True)
+                          return
+
+                      last_error = (
+                          result.stderr.strip()
+                          or result.stdout.strip()
+                          or f"Probe exited with code {result.returncode}"
+                      )
+
+                  except subprocess.TimeoutExpired:
+                      last_error = (
+                          "Readiness probe exceeded its subprocess timeout"
+                      )
+
+                  now = time.monotonic()
+
+                  if now - last_log >= 15:
+                      print(
+                          f"Waiting for n8n readiness: {label}; "
+                          f"last result: {last_error}",
+                          flush=True,
+                      )
+                      last_log = now
+
+                  remaining = deadline - time.monotonic()
+
+                  if remaining > 0:
+                      time.sleep(min(3, remaining))
+
+              check_running()
+
+              raise RuntimeError(
+                  f"n8n readiness timeout after {timeout_seconds}s: "
+                  f"{label}; last result: {last_error}"
+              )
+
+          def verify_identity_and_storage(label):
+              script = r"""
+              const fs = require("fs");
+              const assert = require("assert");
+
+              const uid = Number(process.env.EXPECTED_UID);
+              const gid = Number(process.env.EXPECTED_GID);
+              const status = fs.readFileSync("/proc/1/status", "utf8");
+
+              for (const [field, expected] of [
+                ["Uid", uid],
+                ["Gid", gid],
+              ]) {
+                const match = status.match(
+                  new RegExp("^" + field + ":\\s+(.+)$", "m")
+                );
+
+                assert(match, "Missing PID 1 " + field);
+
+                const values = match[1]
+                  .trim()
+                  .split(/\s+/)
+                  .map(Number);
+
+                assert.strictEqual(values.length, 4);
+
+                for (const actual of values) {
+                  assert.strictEqual(
+                    actual, expected,
+                    "PID 1 " + field + " mismatch"
+                  );
+                }
+              }
+
+              const command = fs.readFileSync(
+                "/proc/1/cmdline", "utf8"
+              ).replace(/\0/g, " ");
+
+              assert(
+                command.includes("n8n"),
+                "PID 1 does not appear to be n8n: " + command
+              );
+
+              console.log("PID 1 command: " + command);
+              console.log(
+                "PASS: running n8n UID=" + uid + " GID=" + gid
+              );
+
+              for (const path of [
+                "/home/node",
+                "/home/node/.n8n",
+                "/home/node/.n8n/database.sqlite",
+              ]) {
+                const stat = fs.statSync(path);
+
+                assert.strictEqual(
+                  stat.uid, uid, path + " UID mismatch"
+                );
+                assert.strictEqual(
+                  stat.gid, gid, path + " GID mismatch"
+                );
+
+                console.log(
+                  "PASS: ownership " + path +
+                  " -> " + stat.uid + ":" + stat.gid
+                );
+              }
+              """
+
+              docker(
+                  "exec",
+                  "-e", f"EXPECTED_UID={uid}",
+                  "-e", f"EXPECTED_GID={gid}",
+                  container,
+                  "node", "-e", script,
+              )
+
+              for flag, expected in [
+                  ("-u", uid),
+                  ("-g", gid),
+              ]:
+                  result = docker(
+                      "exec", container,
+                      "id", flag, "node",
+                      capture=True,
+                  )
+
+                  if result.stdout.strip() != str(expected):
+                      raise RuntimeError(
+                          f"node account {flag} mismatch"
+                      )
+
+              print(
+                  f"PASS: node account IDs: {label}",
+                  flush=True,
+              )
+
+              docker(
+                  "exec",
+                  "--user", f"{uid}:{gid}",
+                  container,
+                  "node", "-e",
+                  r"""
+                  const fs = require("fs");
+                  const assert = require("assert");
+                  const path = "/home/node/.n8n/uid-gid-write-test";
+
+                  fs.writeFileSync(path, "WRITE_OK");
+                  assert.strictEqual(
+                    fs.readFileSync(path, "utf8"), "WRITE_OK"
+                  );
+
+                  const stat = fs.statSync(path);
+                  assert.strictEqual(stat.uid, process.getuid());
+                  assert.strictEqual(stat.gid, process.getgid());
+
+                  fs.unlinkSync(path);
+                  console.log(
+                    "PASS: write/read/delete as requested UID/GID"
+                  );
+                  """,
+              )
+
+          print(
+              f"--- Testing {platform} with random "
+              f"PUID={uid}, PGID={gid} ---",
+              flush=True,
+          )
+
+          # Exercise the unchanged entrypoint and default command.
+          docker(
+              "run", "-d",
+              "--platform", platform,
+              "--name", container,
+              "-e", f"PUID={uid}",
+              "-e", f"PGID={gid}",
+              "-e", "DB_TYPE=sqlite",
+              "-e", "N8N_DIAGNOSTICS_ENABLED=false",
+              "-e", "N8N_VERSION_NOTIFICATIONS_ENABLED=false",
+              "-e", "N8N_RUNNERS_GRANT_TOKEN_TTL=300",
+              image,
+          )
+
+          wait_ready("initial startup")
+          verify_identity_and_storage("initial startup")
+
+          print(
+              f"PASS: initial startup with UID={uid}, GID={gid}",
+              flush=True,
+          )
+
+          print("Restarting n8n once", flush=True)
+          docker("restart", container)
+
+          wait_ready("after restart")
+          verify_identity_and_storage("after restart")
+
+          print(
+              f"PASS: restart with UID={uid}, GID={gid}",
+              flush=True,
+          )
+          print(
+              "ALL STARTUP, UID/GID, STORAGE, AND RESTART TESTS PASSED",
+              flush=True,
+          )
+          PY
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if docker inspect test_n8n >/dev/null 2>&1; then
+            echo "--- n8n container logs ---"
+            docker logs test_n8n 2>&1 || true
+            docker rm -fv test_n8n >/dev/null 2>&1 || true
+          else
+            echo "No remaining test container."
+          fi
+
+      - name: Save tested image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p /tmp/tested-images
+
+          docker image inspect "$TEST_IMAGE" \
+            --format '{{.Id}}' \
+            > "/tmp/tested-images/${ARCH}.id"
+
+          docker save "$TEST_IMAGE" \
+            | gzip -1 > "/tmp/tested-images/${ARCH}.tar.gz"
+
+          test -s "/tmp/tested-images/${ARCH}.tar.gz"
+
+          echo "PASS: saved tested $ARCH image"
+          cat "/tmp/tested-images/${ARCH}.id"
+          ls -lh "/tmp/tested-images/${ARCH}.tar.gz"
+
+      - name: Upload tested image
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-image-${{ matrix.arch }}
+          path: |
+            /tmp/tested-images/${{ matrix.arch }}.tar.gz
+            /tmp/tested-images/${{ matrix.arch }}.id
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    needs: [check-upstream, build-and-test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+
+    env:
+      IMAGE: solodolobolo/n8n
+      N8N_VERSION: ${{ needs.check-upstream.outputs.n8n_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Download tested images
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tested-image-*
+          merge-multiple: true
+          path: /tmp/tested-images
+
+      - name: Load and verify tested images
+        run: |
+          set -euo pipefail
+
+          for arch in amd64 arm64; do
+            echo "--- Loading tested $arch image ---"
+
+            gzip -dc "/tmp/tested-images/${arch}.tar.gz" \
+              | docker load
+
+            expected_id="$(cat "/tmp/tested-images/${arch}.id")"
+
+            actual_id="$(docker image inspect "n8n-ci:$arch" \
+              --format '{{.Id}}')"
+
+            actual_arch="$(docker image inspect "n8n-ci:$arch" \
+              --format '{{.Architecture}}')"
+
+            echo "Expected image ID: $expected_id"
+            echo "Actual image ID:   $actual_id"
+            echo "Expected architecture: $arch; actual: $actual_arch"
+
+            test "$actual_id" = "$expected_id"
+            test "$actual_arch" = "$arch"
+
+            echo "PASS: loaded the exact tested $arch image"
+          done
+
+      - name: Push tested architecture images
+        run: |
+          set -euo pipefail
+
+          mkdir -p /tmp/digests
+
+          for arch in amd64 arm64; do
+            echo "--- Pushing $IMAGE:$arch ---"
+
+            docker tag "n8n-ci:$arch" "$IMAGE:$arch"
+            docker push "$IMAGE:$arch"
+
+            digest="$(docker buildx imagetools inspect "$IMAGE:$arch" \
+              --format '{{.Manifest.Digest}}')"
+
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+            printf '%s@%s\n' "$IMAGE" "$digest" \
+              > "/tmp/digests/${arch}.txt"
+
+            echo "PASS: pushed tested $arch image: $IMAGE@$digest"
+          done
+
+      - name: Publish tags
+        run: |
+          set -euo pipefail
+
+          amd64="$(cat /tmp/digests/amd64.txt)"
+          arm64="$(cat /tmp/digests/arm64.txt)"
+
+          [[ "$N8N_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+          for reference in "$amd64" "$arm64"; do
+            [[ "${reference%@*}" = "$IMAGE" ]]
+            [[ "${reference#*@}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          done
+
+          echo "Publishing AMD64: $amd64"
+          echo "Publishing ARM64: $arm64"
+          echo "Publishing version: $N8N_VERSION"
+
+          # Keep the architecture tags as one-platform indexes,
+          # matching the existing manifest verification structure.
+          docker buildx imagetools create \
+            --tag "$IMAGE:amd64" \
+            "$amd64"
+
+          docker buildx imagetools create \
+            --tag "$IMAGE:arm64" \
+            "$arm64"
+
+          docker buildx imagetools create \
+            --tag "$IMAGE:$N8N_VERSION" \
+            --tag "$IMAGE:latest" \
+            "$amd64" \
+            "$arm64"
+
+      - name: Check manifests
+        run: |
+          python3 -u - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          image = os.environ["IMAGE"]
+          version = os.environ["N8N_VERSION"]
+
+          digests = {
+              arch: Path(f"/tmp/digests/{arch}.txt")
+                  .read_text().strip().split("@", 1)[1]
+              for arch in ("amd64", "arm64")
+          }
+
+          expected = {
+              "amd64": {("linux", "amd64")},
+              "arm64": {("linux", "arm64")},
+              "latest": {
+                  ("linux", "amd64"),
+                  ("linux", "arm64"),
+              },
+              version: {
+                  ("linux", "amd64"),
+                  ("linux", "arm64"),
+              },
+          }
+
+          for tag, required in expected.items():
+              reference = f"{image}:{tag}"
+
+              result = subprocess.run(
+                  [
+                      "docker", "buildx", "imagetools", "inspect",
+                      "--raw", reference,
+                  ],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+
+              manifest = json.loads(result.stdout)
+              entries = manifest.get("manifests", [])
+
+              platforms = {
+                  (
+                      item.get("platform", {}).get("os"),
+                      item.get("platform", {}).get("architecture"),
+                  )
+                  for item in entries
+              }
+
+              if (
+                  platforms != required
+                  or len(entries) != len(required)
+              ):
+                  raise RuntimeError(
+                      f"{reference}: expected {required}, "
+                      f"found {platforms}"
+                  )
+
+              for item in entries:
+                  arch = item["platform"]["architecture"]
+                  actual_digest = item["digest"]
+
+                  if actual_digest != digests[arch]:
+                      raise RuntimeError(
+                          f"{reference}: {arch} digest mismatch: "
+                          f"expected {digests[arch]}, "
+                          f"found {actual_digest}"
+                      )
+
+              print(
+                  f"PASS: {reference} -> {sorted(platforms)}",
+                  flush=True,
+              )
+          PY
+
+      - name: Update Dockerfile
+        run: |
+          python3 -u - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("Dockerfile")
+          text = path.read_text()
+          version = os.environ["N8N_VERSION"]
+
+          if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+              raise RuntimeError(
+                  f"Invalid N8N_VERSION: {version!r}"
+              )
+
+          pattern = re.compile(
+              r"^([ \t]*ARG[ \t]+N8N_VERSION[ \t]*=[ \t]*)"
+              r"([\"']?)(\d+\.\d+\.\d+)\2"
+              r"([ \t]*(?:#.*)?)$",
+              re.MULTILINE,
+          )
+
+          def replace(match):
+              prefix, quote, old_version, suffix = match.groups()
+
+              print(
+                  f"N8N_VERSION: {old_version} -> {version}",
+                  flush=True,
+              )
+
+              return (
+                  f"{prefix}{quote}{version}{quote}{suffix}"
+              )
+
+          text, count = pattern.subn(replace, text)
+
+          if count != 1:
+              raise RuntimeError(
+                  "Expected one N8N_VERSION declaration; "
+                  f"found {count}"
+              )
+
+          path.write_text(text)
+          PY
+
+      - name: Commit versions
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "github-actions[bot]@users.noreply.github.com"
+
+          git add Dockerfile
+
+          if git diff --cached --quiet; then
+            echo "Dockerfile version unchanged; nothing to commit."
+            exit 0
+          fi
+
+          git diff --cached -- Dockerfile
+
+          git commit \
+            -m "chore: update Dockerfile to tested n8n version"
+
+          git push origin "HEAD:${GITHUB_REF_NAME}"
