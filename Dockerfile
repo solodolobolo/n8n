@@ -1,4 +1,4 @@
-ARG N8N_VERSION=2.48.7
+ARG N8N_VERSION=2.48.8
 
 FROM alpine:3.22 AS tool-source
 RUN apk add --no-cache shadow su-exec libbsd
